@@ -4,18 +4,20 @@ Export issues where the current user logged work in the last N days (same idea a
   worklogAuthor = currentUser() AND worklogDate >= -7d
 ).
 
-Credentials: environment variables JIRA_SITE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN (e.g.
-GitHub Actions secrets). Optionally ~/.cursor/credentials.env merges via setdefault.
+Credentials: ~/.cursor/credentials.env (JIRA_SITE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN).
 Optional: REQUEST_VERIFY_SSL=false
 
 Usage:
-  python3 jira_worklog.py --days 7
-  python3 jira_worklog.py --7d
-  python3 jira_worklog.py 7d
-  python3 jira_worklog.py 7 -o worklogs.csv
-  python3 jira_worklog.py --days 14 --details
-  python3 jira_worklog.py --days 14 --by-day
-  python3 jira_worklog.py --by-day -o summary.txt --timezone Asia/Kolkata
+  python3 scripts/jira_worklog.py --days 7
+  python3 scripts/jira_worklog.py --7d
+  python3 scripts/jira_worklog.py 7d
+  python3 scripts/jira_worklog.py 7 -o worklogs.csv
+  python3 scripts/jira_worklog.py --days 14 --details
+  python3 scripts/jira_worklog.py --days 14 --by-day
+  python3 scripts/jira_worklog.py --by-day -o summary.txt --timezone Asia/Kolkata
+
+Shell alias (optional):
+  alias worklog='python3 /path/to/fse-mgmt/scripts/jira_worklog.py'
 """
 
 from __future__ import annotations
@@ -66,6 +68,16 @@ def _auth_headers() -> dict[str, str]:
 
 def _verify_ssl() -> bool:
     return os.environ.get("REQUEST_VERIFY_SSL", "true").lower() not in ("false", "0", "no")
+
+
+def _redact_email(email: str | None) -> str:
+    """For logs only — avoids printing full secrets context."""
+    if not email or "@" not in email:
+        return "(not set or invalid)"
+    local, _, domain = email.partition("@")
+    if len(local) <= 2:
+        return f"***@{domain}"
+    return f"{local[:2]}***@{domain}"
 
 
 def _maybe_disable_insecure_warnings() -> None:
@@ -256,17 +268,48 @@ def _pick_api_prefix(site_url: str, headers: dict[str, str]) -> str:
     """Use REST v3 when possible; fall back to v2 (some Jira Server instances)."""
     try:
         import requests
+        from requests.exceptions import RequestException
     except ImportError as e:
         raise SystemExit("Install requests: pip install requests") from e
 
+    base = site_url.rstrip("/")
+    details: list[str] = []
+
     for prefix in ("/rest/api/3", "/rest/api/2"):
-        url = f"{site_url.rstrip('/')}{prefix}/myself"
-        r = requests.get(url, headers=headers, timeout=30, verify=_verify_ssl())
-        if r.status_code == 200:
-            return prefix
-    raise SystemExit(
-        "Could not reach Jira /myself on API v3 or v2. Check URL, token, and permissions."
-    )
+        path = f"{prefix}/myself"
+        url = f"{base}{path}"
+        try:
+            r = requests.get(url, headers=headers, timeout=30, verify=_verify_ssl())
+            if r.status_code == 200:
+                return prefix
+            snippet = ((r.text or "").replace("\n", " ").replace("\r", " "))[:500]
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+            details.append(
+                f"  GET {path} -> HTTP {r.status_code} "
+                f"Content-Type={ctype or '?'} Body={snippet!r}"
+            )
+        except RequestException as e:
+            details.append(f"  GET {path} -> REQUEST FAILED {type(e).__name__}: {e}")
+
+    jira_verbose = os.environ.get("JIRA_VERBOSE", "").lower() in ("1", "true", "yes")
+
+    diag = [
+        "Jira /myself failed for BOTH API v3 and v2 (see below).",
+        f"  Base URL: {base}",
+        f"  TLS verify (REQUEST_VERIFY_SSL): {_verify_ssl()}",
+        "  Authenticating as "
+        + _redact_email(os.environ.get("JIRA_USER_EMAIL")),
+        *(["  Headers: Authorization=Basic **** (token not logged)"] if jira_verbose else []),
+        "",
+        *details,
+        "",
+        "Likely fixes:",
+        "  - JIRA_SITE_URL must be root only (Jira Cloud: https://YOURSITE.atlassian.net). No /wiki, no /browse/... path.",
+        "  - Use an Atlassian API token for JIRA_USER_EMAIL (not UI password); regenerate if unsure.",
+        "  - Corporate/self-hosted: GitHub-hosted runners cannot reach VPN-only hosts; use a self-hosted runner or allow egress.",
+        "  - Broken TLS/intercept proxies: repo secret REQUEST_VERIFY_SSL=false (use only when you trust the network).",
+    ]
+    raise SystemExit("\n".join(diag))
 
 
 def _format_jira_datetime(iso: str | None) -> str:
