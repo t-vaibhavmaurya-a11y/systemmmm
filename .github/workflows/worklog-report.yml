@@ -1,0 +1,74 @@
+name: Jira worklog export
+
+on:
+  schedule:
+    # GitHub cron is UTC — 06:15 UTC daily (adjust as needed)
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Lookback days (matches local `worklog --days N`)
+        required: false
+        default: "14"
+      timezone:
+        description: IANA timezone for day grouping (e.g. Asia/Kolkata)
+        required: false
+        default: "Asia/Kolkata"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JIRA_SITE_URL: ${{ secrets.JIRA_SITE_URL }}
+      JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+    steps:
+      - name: Check Jira secrets
+        run: |
+          missing=0
+          for v in JIRA_SITE_URL JIRA_USER_EMAIL JIRA_API_TOKEN; do
+            eval "val=\$$v"
+            if [ -z "$val" ]; then echo "::error::Missing secret $v — add it under repo Settings → Secrets."; missing=1; fi
+          done
+          exit "$missing"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Resolve parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "days=${{ github.event.inputs.days }}" >> "$GITHUB_OUTPUT"
+            echo "tz=${{ github.event.inputs.timezone }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "days=14" >> "$GITHUB_OUTPUT"
+            echo "tz=Asia/Kolkata" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run worklog export
+        env:
+          REQUEST_VERIFY_SSL: ${{ secrets.REQUEST_VERIFY_SSL }}
+        run: |
+          set -eux
+          mkdir -p out
+          DAYS="${{ steps.params.outputs.days }}"
+          TZ="${{ steps.params.outputs.tz }}"
+          python jira_worklog.py --by-day --days "$DAYS" --timezone "$TZ" -o out/worklog-by-day.txt
+          python jira_worklog.py --days "$DAYS" -o out/issues-summary.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worklog-${{ github.run_id }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 90
